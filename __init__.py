@@ -280,6 +280,7 @@ antigravity_profile = AntigravityOAuthProfile(
     default_aux_model="",
     fallback_models=_FALLBACK_MODELS,
     supports_vision=True,
+    supports_streaming=True,
     classify_api_error=_classify_antigravity_error,
     auth_handler=antigravity_auth_handler,
 )

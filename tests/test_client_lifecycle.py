@@ -45,6 +45,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # Add plugin parent dir to sys.path
@@ -375,6 +376,254 @@ class CyclicGcLockReentranceTests(unittest.TestCase):
         client._lock.release()
 
         client.close()
+
+
+class RequestCancellationTests(unittest.TestCase):
+    def setUp(self):
+        _pin_host_dependent_seams(self)
+        directory = tempfile.TemporaryDirectory(prefix="agy_cancel_test_")
+        self.addCleanup(directory.cleanup)
+        self.client = AntigravityClient(cwd=directory.name)
+        self.addCleanup(self.client.close)
+
+    def test_cancel_interrupts_owned_child_before_stream_exists(self):
+        self._cancel_blocked_input()
+
+    def test_cancel_interrupts_oneshot_before_stream_exists(self):
+        self.client._worker_lock.acquire()
+        try:
+            self._cancel_blocked_input(worker_reserved=True)
+        finally:
+            self.client._worker_lock.release()
+
+    def test_oneshot_child_that_exits_before_reading_input_still_answers(self):
+        # Without cancellation, a stdin failure is not the request outcome:
+        # the stream must still read the child's result.
+        import subprocess
+        executable = getattr(sys, "_base_executable", sys.executable)
+        script = ("import json\nfor e in [{'event':'text_delta','text_delta':'answer'},"
+                  "{'event':'result','result':{'status':'SUCCESS','response':'answer'}}]:"
+                  "\n    print(json.dumps(e), flush=True)\n")
+        real_popen = subprocess.Popen
+        def spawn(*args, **kwargs):
+            return real_popen([executable, "-u", "-c", script], **{
+                k: v for k, v in kwargs.items() if k not in ("cwd", "env")})
+        self.client._worker_lock.acquire()
+        try:
+            with patch("client.subprocess", SimpleNamespace(Popen=spawn, PIPE=subprocess.PIPE)):
+                result = self.client.chat.completions.create(model=MODEL,
+                    messages=[{"role": "user", "content": "x" * 2_000_000}], timeout=30)
+        finally:
+            self.client._worker_lock.release()
+        self.assertEqual(result.choices[0].message.content, "answer")
+
+    def _cancel_blocked_input(self, worker_reserved=False):
+        import subprocess
+        import time
+        executable = getattr(sys, "_base_executable", sys.executable)
+        real_popen = subprocess.Popen
+        processes = []
+        started = threading.Event()
+        errors = []
+        def spawn(*args, **kwargs):
+            proc = real_popen([executable, "-u", "-c", "import time; time.sleep(30)"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, **__import__('process')._own_process_group())
+            processes.append(proc)
+            started.set()
+            return proc
+        def run():
+            try:
+                self.client.chat.completions.create(model=MODEL,
+                    messages=[{"role":"user", "content":"x" * 2_000_000}], timeout=30)
+            except Exception as exc:
+                errors.append(exc)
+        with patch("client.subprocess", SimpleNamespace(Popen=spawn, PIPE=subprocess.PIPE)):
+            owner = threading.Thread(target=run, daemon=True)
+            owner.start()
+            try:
+                self.assertTrue(started.wait(3))
+                time.sleep(.1)
+                self.assertTrue(owner.is_alive())
+                self.client.cancel()
+                self.client.cancel()
+                owner.join(3)
+                self.assertFalse(owner.is_alive(), "cancel did not unblock stdin owner")
+                self.assertEqual(len(processes), 1, "cancel replayed the request")
+                self.assertTrue(errors and isinstance(errors[0], InterruptedError), errors)
+                self.assertEqual(self.client._worker_lock.locked(), worker_reserved)
+                self.assertEqual(self.client._worker_history, [])
+            finally:
+                for proc in processes:
+                    if proc.poll() is None: proc.kill()
+                    proc.wait(timeout=3)
+                    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                        if pipe is not None: pipe.close()
+                owner.join(3)
+        if worker_reserved:
+            return
+        self.client.cancel()
+        proc = _mock_proc(_worker_turn_lines("fresh", "fresh answer"))
+        with patch("client.subprocess.Popen", return_value=proc):
+            result = self.client.chat.completions.create(model=MODEL, messages=TURN_MESSAGES)
+        self.assertEqual(result.choices[0].message.content, "fresh answer")
+
+
+    def test_cancel_during_poll_fences_late_content_and_history(self):
+        entered, resume = threading.Event(), threading.Event()
+        errors, chunks = [], []
+        reader = MagicMock()
+        def poll(_):
+            entered.set()
+            self.assertTrue(resume.wait(3))
+            return ["late reasoning"]
+        reader.poll.side_effect = poll
+        proc = _mock_proc(_worker_turn_lines("poll", "late answer"))
+        def consume(stream):
+            try: chunks.extend(stream)
+            except Exception as exc: errors.append(exc)
+        with patch("client.subprocess.Popen", return_value=proc), \
+             patch("client.ThinkingReader.before_request", return_value=reader):
+            stream = self.client.chat.completions.create(model=MODEL, messages=TURN_MESSAGES, stream=True)
+            owner = threading.Thread(target=consume, args=(stream,), daemon=True)
+            owner.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                self.client.cancel()
+                # Foreign cancellation must not close the in-flight DB reader.
+                reader.close.assert_not_called()
+            finally:
+                resume.set()
+                owner.join(3)
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(chunks, [])
+        self.assertTrue(errors and isinstance(errors[0], InterruptedError), errors)
+        self.assertEqual(self.client._worker_history, [])
+        self.assertFalse(self.client._worker_lock.locked())
+
+    def test_old_nonstream_exception_does_not_release_new_stream_lock(self):
+        from stream import collect_stream_completion
+        old_done, resume_old = threading.Event(), threading.Event()
+        errors = []
+        proc = _mock_proc(_worker_turn_lines('reuse', 'one')[:-1] + _worker_turn_lines('reuse', 'two'))
+        def collect_then_fail(stream, **kwargs):
+            collect_stream_completion(stream, **kwargs)
+            old_done.set()
+            self.assertTrue(resume_old.wait(3))
+            raise RuntimeError('post-completion fixture failure')
+        def run():
+            try: self.client.chat.completions.create(model=MODEL, messages=TURN_MESSAGES)
+            except Exception as exc: errors.append(exc)
+        with patch('client.subprocess.Popen', return_value=proc), \
+             patch('client.collect_stream_completion', side_effect=collect_then_fail):
+            owner = threading.Thread(target=run, daemon=True)
+            owner.start()
+            try:
+                self.assertTrue(old_done.wait(3))
+                continuation = TURN_MESSAGES + [{'role':'assistant','content':'one'}, {'role':'user','content':'next'}]
+                current = self.client.chat.completions.create(model=MODEL, messages=continuation, stream=True)
+            finally:
+                resume_old.set()
+                owner.join(3)
+            self.assertFalse(owner.is_alive())
+            self.assertTrue(errors and isinstance(errors[0], RuntimeError), errors)
+            self.assertTrue(self.client._worker_lock.locked())
+            proc.terminate.assert_not_called()
+            chunks = list(current)
+            self.assertEqual(''.join(c.delta.content or '' for x in chunks for c in x.choices), 'two')
+            self.assertFalse(self.client._worker_lock.locked())
+
+    def test_cancel_before_startup_does_not_spawn_or_poison_next_turn(self):
+        entered, resume = threading.Event(), threading.Event()
+        errors = []
+        def authenticate():
+            entered.set()
+            self.assertTrue(resume.wait(3))
+            return True
+        def run():
+            try:
+                self.client.chat.completions.create(model=MODEL, messages=TURN_MESSAGES)
+            except Exception as exc:
+                errors.append(exc)
+        proc = _mock_proc(_worker_turn_lines('later', 'later answer'))
+        with patch("client.is_authenticated", side_effect=authenticate), \
+             patch("client.subprocess.Popen", return_value=proc) as spawn, \
+             patch.object(self.client, '_sync_workspace_rules', wraps=self.client._sync_workspace_rules) as rules:
+            owner = threading.Thread(target=run, daemon=True)
+            owner.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                self.client.cancel()
+                with patch('client.is_authenticated', return_value=True):
+                    current = self.client.chat.completions.create(model=MODEL, messages=TURN_MESSAGES, stream=True)
+                rules.reset_mock()
+            finally:
+                resume.set()
+                owner.join(3)
+            self.assertFalse(owner.is_alive())
+            spawn.assert_called_once()
+            rules.assert_not_called()  # cancelled startup cannot touch a later turn's rules
+            self.assertTrue(self.client._worker_lock.locked())
+            proc.terminate.assert_not_called()
+            list(current)
+        self.assertTrue(errors and isinstance(errors[0], InterruptedError), errors)
+        self.assertFalse(self.client._worker_lock.locked())
+
+    def test_cancel_worker_and_concurrent_oneshot_readers(self):
+        import subprocess
+        real_popen = subprocess.Popen
+        executable = getattr(sys, "_base_executable", sys.executable)
+        processes, errors = [], []
+        def spawn(*args, **kwargs):
+            proc = real_popen([executable, "-u", "-c", "import time; time.sleep(30)"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, **__import__('process')._own_process_group())
+            processes.append(proc)
+            return proc
+        def consume(stream):
+            try:
+                list(stream)
+            except Exception as exc:
+                errors.append(exc)
+        with patch("client.subprocess", SimpleNamespace(Popen=spawn, PIPE=subprocess.PIPE)):
+            streams = [self.client.chat.completions.create(model=MODEL, messages=TURN_MESSAGES,
+                stream=True) for _ in range(2)]
+            owners = [threading.Thread(target=consume, args=(stream,), daemon=True) for stream in streams]
+            try:
+                for owner in owners: owner.start()
+                self.client.cancel()
+                for owner in owners: owner.join(3)
+                self.assertTrue(all(not owner.is_alive() for owner in owners))
+                self.assertEqual(len(errors), 2)
+                self.assertTrue(all(isinstance(exc, InterruptedError) for exc in errors), errors)
+                self.assertEqual(self.client._worker_history, [])
+                self.assertEqual(self.client._requests, {})
+                self.assertFalse(self.client._worker_lock.locked())
+                self.assertTrue(all(proc.poll() is not None for proc in processes))
+            finally:
+                for proc in processes:
+                    if proc.poll() is None: proc.kill()
+                    proc.wait(timeout=3)
+                    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                        if pipe is not None: pipe.close()
+                for owner in owners: owner.join(3)
+
+    def test_cancel_abandoned_stream_cannot_release_or_kill_later_turn(self):
+        old_proc = _mock_proc(_worker_turn_lines("old", "old answer"))
+        new_proc = _mock_proc(_worker_turn_lines("new", "new answer"))
+        with patch("client.subprocess.Popen", side_effect=[old_proc, new_proc]):
+            old = self.client.chat.completions.create(model=MODEL, messages=TURN_MESSAGES, stream=True)
+            self.client.cancel()
+            current = self.client.chat.completions.create(model=MODEL, messages=TURN_MESSAGES, stream=True)
+            old.close()
+            with self.assertRaises(InterruptedError): next(old)
+            self.assertTrue(self.client._worker_lock.locked())
+            new_proc.terminate.assert_not_called()
+            chunks = list(current)
+            self.assertEqual("".join(c.delta.content or "" for x in chunks for c in x.choices), "new answer")
+            self.client.cancel()  # completed token removed; reusable worker is untouched
+            new_proc.terminate.assert_not_called()
+            self.assertEqual(self.client._requests, {})
 
 
 class WorkspaceCleanupTests(unittest.TestCase):

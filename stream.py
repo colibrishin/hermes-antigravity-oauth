@@ -12,7 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from typing import Any, Iterator, NamedTuple
+from typing import Any, Generator, Iterator, NamedTuple
 
 try:
     from .process import _check_early_quota_error
@@ -198,6 +198,7 @@ class AntigravityStream(Iterator[Any]):
         messages: list[dict[str, Any]] | None = None,
         usage_baseline: dict[str, int] | None = None,
         thinking_reader: Any = None,
+        request_token=None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -214,6 +215,9 @@ class AntigravityStream(Iterator[Any]):
                 "that acquired it must carry the ownership flag so its "
                 "cleanup can release it."
             )
+        self._request_registered = request_token is not None
+        self._request_token = request_token or threading.Event()
+        self._iteration_lock = threading.RLock()
         self._thinking_reader = thinking_reader
         self._reader_stop = threading.Event()
         self._reader_thread = None
@@ -254,17 +258,42 @@ class AntigravityStream(Iterator[Any]):
         # __next__, so no idle thread outlives either end of life. See
         # __anext__ for why this is not the shared default executor.
         self._async_executor: ThreadPoolExecutor | None = None
+        if request_token is not None:
+            import weakref
+            with client._lock:
+                client._requests[request_token].stream = weakref.ref(self)
+
+    def _check_cancelled(self) -> None:
+        if self._request_token.is_set():
+            raise InterruptedError("Antigravity request cancelled.")
+
+    def _end_request(self) -> None:
+        if self._request_registered:
+            with self.client._lock:
+                self.client._requests.pop(self._request_token, None)
 
     def __iter__(self) -> "AntigravityStream":
         return self
 
     def __next__(self) -> Any:
+        with self._iteration_lock:
+            try:
+                self._check_cancelled()
+                chunk = self._next_chunk()
+                self._check_cancelled()
+                return chunk
+            except InterruptedError:
+                self.close()
+                raise
+
+    def _next_chunk(self) -> Any:
         if self._closed:
             raise StopIteration
         try:
             return next(self._generator)
         except StopIteration:
             self._closed = True
+            self._end_request()
             # Exhaustion is end of life for the stream even when the worker
             # lives on (the success path deliberately does not close()), so
             # the private async executor is retired here too; otherwise its
@@ -391,12 +420,21 @@ class AntigravityStream(Iterator[Any]):
             executor = self._async_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="agy-stream"
             )
+        pull = asyncio.get_running_loop().run_in_executor(executor, self._pull_chunk)
         try:
-            stream_exhausted, chunk = await asyncio.get_running_loop().run_in_executor(
-                executor, self._pull_chunk
-            )
+            stream_exhausted, chunk = await asyncio.shield(pull)
         except asyncio.CancelledError:
             self.close()
+            # Cancellation must not report cleanup complete while the owner
+            # still owns the reader/lock. Shield preserves its future so we
+            # can await bounded owner unwind, never generator.close() cross-thread.
+            try:
+                await asyncio.wait_for(asyncio.shield(pull), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning("Antigravity async cancellation exceeded the owner unwind budget.")
+                pull.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+            except Exception:
+                pass  # the owner's unwind outcome must not replace CancelledError
             raise
         if stream_exhausted:
             raise StopAsyncIteration
@@ -418,9 +456,22 @@ class AntigravityStream(Iterator[Any]):
         self.close()
 
     def close(self) -> None:
+        # The consuming owner alone mutates reader/history/lock state. A
+        # foreign close interrupts its I/O, then the owner runs cleanup.
+        if not self._iteration_lock.acquire(blocking=False):
+            self._request_token.set()
+            self.client._terminate_process(self.proc)
+            return
+        try:
+            self._close_owned()
+        finally:
+            self._iteration_lock.release()
+
+    def _close_owned(self) -> None:
         if self._closed:
             return
         self._closed = True
+        self._end_request()
         self._stop_optional_readers()
         if self.is_worker:
             # Terminate the worker only if it is still OURS. The interrupted
@@ -444,6 +495,11 @@ class AntigravityStream(Iterator[Any]):
         # already-shut-down executor accepts shutdown() again.
         self._retire_executor()
         self._join_stdout_reader()
+        # A cancellation detected after a yield leaves the generator paused,
+        # not unwound. Run its finally (including the quota watchdog stop)
+        # only under the iteration gate and never while it is executing.
+        if not getattr(self._generator, "gi_running", True):
+            self._generator.close()
 
     def _stop_optional_readers(self) -> None:
         self._reader_stop.set()
@@ -557,6 +613,7 @@ class AntigravityStream(Iterator[Any]):
         status: str,
         process_exit: int | None,
         has_evidence: bool,
+        stop_detail: str = "",
     ) -> str:
         """Detail for a turn that ended without proving success.
 
@@ -587,11 +644,12 @@ class AntigravityStream(Iterator[Any]):
             if process_exit not in (None, 0):
                 detail += f", process exited with return code {process_exit}"
             return detail
+        suffix = f" ({stop_detail})" if stop_detail else ""
         if process_exit is None:
-            return "no result event, process still alive"
-        return f"no result event, process exited with return code {process_exit}"
+            return "no result event, process still alive" + suffix
+        return f"no result event, process exited with return code {process_exit}" + suffix
 
-    def _stream_generator(self) -> Iterator[Any]:
+    def _stream_generator(self) -> Generator[Any, None, None]:
         deadline = time.monotonic() + self.timeout
         text_buffer = ""
         usage_data: dict[str, Any] = {}
@@ -609,6 +667,10 @@ class AntigravityStream(Iterator[Any]):
         # agy cut the reply at the output cap (see _is_output_limit_error).
         output_truncated = False
         start_time = time.monotonic()
+        # Why the read loop ended (diagnostics for missing-result failures):
+        # None after the loop means the absolute deadline expired.
+        stop_reason: str | None = None
+        last_stdout_at: float | None = None
 
         gemini_dir = getattr(self.client, "_isolated_gemini_dir", None)
         watchdog_stop = threading.Event()
@@ -638,11 +700,14 @@ class AntigravityStream(Iterator[Any]):
 
         try:
             while time.monotonic() < deadline:
+                self._check_cancelled()
                 if self._early_error:
                     raise RuntimeError(f"Antigravity model error: {self._early_error}")
 
                 line = self._read_line(deadline)
+                self._check_cancelled()
                 if self._closed:
+                    stop_reason = "stream closed"
                     break
                 if self._thinking_reader is not None and time.monotonic() >= self._thinking_next_poll:
                     self._thinking_next_poll = time.monotonic() + 0.1
@@ -659,7 +724,9 @@ class AntigravityStream(Iterator[Any]):
                     # `_read_line` returns an empty string exclusively on EOF of the
                     # reader thread's blocking `readline()`; no `proc.poll()` or
                     # `time.sleep()` needed.
+                    stop_reason = "stdout closed"
                     break
+                last_stdout_at = time.monotonic()
 
                 line = line.strip()
                 if not line.startswith("{"):
@@ -692,9 +759,15 @@ class AntigravityStream(Iterator[Any]):
                                         step.get("tool_name"), call.function.name)
                             has_tool_calls = True
                             text_buffer = ""
-                            yield self._make_chunk(tool_calls=[call])
-                            self.close()
+                            # Retire agy BEFORE exposing a host action. Do not
+                            # close the iterator here: it still owes the host
+                            # its tool_calls finish reason and usage chunk.
+                            if self.is_worker:
+                                self.client._terminate_worker()
+                            else:
+                                self.client._terminate_process(self.proc)
                             neutralized_tool_step = True
+                            yield self._make_chunk(tool_calls=[call])
                             break
                         logger.warning(
                             "Antigravity attempted native tool invocation '%s'; neutralizing to prevent host execution.",
@@ -822,8 +895,18 @@ class AntigravityStream(Iterator[Any]):
                     )
                     break
 
+            self._check_cancelled()
             self._stop_optional_readers()
             self._join_stdout_reader()
+            if not saw_result and stop_reason is None:
+                stop_reason = f"stream deadline {self.timeout:g}s reached"
+            now = time.monotonic()
+            stop_detail = f"{stop_reason or 'result'} after {now - start_time:.1f}s"
+            stop_detail += (
+                f", last stdout {now - last_stdout_at:.1f}s ago"
+                if last_stdout_at is not None
+                else ", no stdout received"
+            )
             if text_buffer and not has_tool_calls:
                 if self.has_tools or "<tool_call>" in text_buffer:
                     parsed_calls, extra_text = _parse_tool_block(text_buffer)
@@ -934,6 +1017,7 @@ class AntigravityStream(Iterator[Any]):
                             status=status,
                             process_exit=returncode,
                             has_evidence=has_content or has_tool_calls,
+                            stop_detail=stop_detail,
                         )
                     )
             else:
@@ -1027,6 +1111,7 @@ class AntigravityStream(Iterator[Any]):
                             status=status,
                             process_exit=worker_exit,
                             has_evidence=has_content or has_tool_calls,
+                            stop_detail=stop_detail,
                         )
                     )
 
@@ -1104,13 +1189,16 @@ class AntigravityStream(Iterator[Any]):
                     # retire it explicitly so the next turn respawns with the
                     # full history Hermes sends.
                     self.client._terminate_worker()
-                if success and not self._interrupted:
-                    if self.proc is self.client._worker_proc:
-                        self.client._worker_conversation_id = self.conversation_id
-                    self.client._update_worker_history(self.messages)
-                    self._release_worker_lock_once()
-                else:
-                    self.close()
+                with self.client._lock:
+                    cancelled = self._request_token.is_set()
+                    if success and not self._interrupted and not cancelled:
+                        if self.proc is self.client._worker_proc:
+                            self.client._worker_conversation_id = self.conversation_id
+                            self.client._update_worker_history(self.messages)
+                        self._end_request()
+                        self._release_worker_lock_once()
+                    else:
+                        self.close()
             else:
                 self.close()
 

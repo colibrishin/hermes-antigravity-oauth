@@ -180,8 +180,9 @@ class LiveThinkingTests(unittest.TestCase):
 
     def test_timeout_closes_reader_and_releases_lock(self):
         stream, reader, writer, lock, client = self.pipe_stream(timeout=.15)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as ctx:
             list(stream)
+        self.assertIn("stream deadline 0.15s reached after", str(ctx.exception))
         self.assertTrue(reader.closed)
         self.assertFalse(stream._reader_thread.is_alive())
         self.assertFalse(lock.locked())

@@ -57,8 +57,13 @@ class StreamBridgeTests(unittest.TestCase):
         # Hermetic: never probe the host keyring (on Linux that probe itself goes through Popen).
         with patch("client.is_authenticated", return_value=True), \
                 patch("subprocess.Popen", return_value=proc), patch.object(client, "_terminate_process") as term:
-            chunks = list(client.chat.completions.create(model="claude-sonnet-4-6", tools=tools, stream=True,
-                                                         messages=[{"role": "user", "content": "run it"}]))
+            stream = client.chat.completions.create(model="claude-sonnet-4-6", tools=tools, stream=True,
+                                                   messages=[{"role": "user", "content": "run it"}])
+            chunks = []
+            for chunk in stream:
+                if any(choice.delta.tool_calls for choice in chunk.choices):
+                    term.assert_called_once_with(proc)  # retired BEFORE exposing the action
+                chunks.append(chunk)
         return chunks, term, proc
 
     def test_native_run_command_is_reissued_as_hermes_terminal_call(self):
@@ -66,17 +71,18 @@ class StreamBridgeTests(unittest.TestCase):
                   {"event": "step_update", "step_update": _step("run_command", {"CommandLine": "echo SOUL_42"})}]
         chunks, term, proc = self._run(events, TERMINAL_TOOL)
         term.assert_called_once_with(proc)  # agy never gets to execute it
-        calls = [tc for ch in chunks for tc in (ch.choices[0].delta.tool_calls or [])]
+        calls = [tc for ch in chunks for choice in ch.choices for tc in (choice.delta.tool_calls or [])]
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].function.name, "terminal")
         self.assertEqual(json.loads(calls[0].function.arguments)["command"], "echo SOUL_42")
-        self.assertEqual(chunks[-1].choices[0].finish_reason, "tool_calls")
+        self.assertEqual([c.finish_reason for ch in chunks for c in ch.choices if c.finish_reason], ["tool_calls"])
+        self.assertEqual(sum(ch.usage is not None for ch in chunks), 1)
 
     def test_unmappable_native_tool_still_neutralized_without_call(self):
         events = [{"event": "step_update", "step_update": _step("browser_click_element", {"x": 1})}]
         chunks, term, proc = self._run(events, TERMINAL_TOOL)
         term.assert_called_once_with(proc)
-        calls = [tc for ch in chunks for tc in (ch.choices[0].delta.tool_calls or [])]
+        calls = [tc for ch in chunks for choice in ch.choices for tc in (choice.delta.tool_calls or [])]
         self.assertEqual(calls, [])
 
 

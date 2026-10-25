@@ -108,10 +108,24 @@ That fallback is **unknown metadata, not native model capacity**. If necessary,
 set an explicit conservative budget for your route. This change does not establish
 million-token account acceptance; serving limits require separate live testing.
 
-## Live reasoning on non-streaming Hermes turns
+## Streaming and cancellation
 
-`external_process` authentication remains unchanged: Hermes selects its normal
-non-streaming path. For foreground agents with an installed reasoning callback
+Responses stream into Hermes as agy produces them. Calls made with
+`stream=False` still return one completed response.
+
+When Hermes cancels an in-flight request (for example after a timeout), the
+plugin stops that request's agy process; the next request starts normally.
+
+Streaming calls honor the read budget of the `httpx.Timeout` Hermes passes
+(for this local provider normally `HERMES_API_TIMEOUT`, 1800s) instead of the
+plugin's 300s scalar default, which still applies when no timeout is given. If
+a turn ends without agy's `result` event, the error names why reading stopped
+(stream deadline or stdout closed), the elapsed time and the age of the last
+stdout line.
+
+### Live reasoning for non-streaming calls
+
+For non-streaming calls from foreground agents with an installed reasoning callback
 and a text-stream consumer, the plugin's collector forwards available reasoning
 while it assembles the response. It calls the existing callback, preserving the
 TUI's show/hide and notification-mute gates. Reasoning remains separate from
@@ -139,7 +153,7 @@ history restoration and actual frontend rendering are separate from delivery.
 
 The opt-in `scripts/verify_live_reasoning.py` makes one bounded, tool-free call to
 bare `gemini-4-argon` using the existing account. It exercises real AIAgent kwargs,
-the unchanged `_should_stream=False` decision, middleware, the nonstream worker,
+an explicit non-streaming session override, middleware, the nonstream worker,
 agy/DB reader, collector, and installed TUI reasoning callback. Only UI egress is
 captured; it does not prove display in an existing desktop window. Its receipt
 records counts/times, never reasoning text. See `VERIFICATION.md`.

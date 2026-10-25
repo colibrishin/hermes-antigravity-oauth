@@ -309,6 +309,7 @@ class AntigravityClient:
         # session cannot corrupt a later session's baseline.
         self._worker_usage_baseline: dict[str, int] = {}
         self._worker_lock = threading.Lock()
+        self._requests: dict[threading.Event, SimpleNamespace] = {}
 
     @staticmethod
     def _resolve_real_token_path() -> Path | None:
@@ -333,6 +334,29 @@ class AntigravityClient:
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+
+    def cancel(self) -> None:
+        """Cancel currently admitted requests, never future turns or the workspace."""
+        with self._lock:
+            requests = tuple(self._requests.items())
+            for token, _request in requests:
+                token.set()
+        for token, request in requests:
+            if request.proc is not None:
+                self._terminate_process(request.proc)
+            stream = request.stream() if request.stream is not None else None
+            if stream is not None:
+                stream.close()
+
+    @staticmethod
+    def _check_cancelled(token) -> None:
+        if token.is_set():
+            raise InterruptedError("Antigravity request cancelled.")
+
+    def _bind_request_process(self, token, proc) -> None:
+        # Caller holds _lock across its cancellation check, spawn and this
+        # publication; cancel() sets tokens under the same lock.
+        self._requests[token].proc = proc
 
     def close(self) -> None:
         # Phase 1 -- terminate every child process BEFORE the workspace is
@@ -525,7 +549,9 @@ class AntigravityClient:
         tool_choice: Any,
         stream: bool,
         reasoning_emitter=None,
+        request_token=None,
     ) -> Any:
+        self._check_cancelled(request_token)
         rules = self._sync_workspace_rules(messages)
         prompt_text = _format_messages_as_prompt(
             messages, model=model, tools=tools, tool_choice=tool_choice, rules_in_workspace=rules
@@ -536,19 +562,23 @@ class AntigravityClient:
         if effort:
             cmd_args.extend(["--effort", effort])
 
-        proc = subprocess.Popen(
-            cmd_args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            cwd=self._cwd,
-            env=self._child_env(),
-            **_own_process_group(),
-        )
+        with self._lock:
+            self._check_cancelled(request_token)
+            proc = subprocess.Popen(
+                cmd_args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                cwd=self._cwd,
+                env=self._child_env(),
+                **_own_process_group(),
+            )
+            self._bind_request_process(request_token, proc)
+            self._active_processes.add(proc)
 
         thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
         try:
@@ -557,10 +587,12 @@ class AntigravityClient:
                 proc.stdin.flush()
                 proc.stdin.close()
         except OSError:
-            pass
-
-        with self._lock:
-            self._active_processes.add(proc)
+            pass  # an early-exiting child still reports its outcome via the stream
+        try:
+            self._check_cancelled(request_token)
+        except InterruptedError:
+            thinking_reader.close()
+            raise
 
         stream_iter = AntigravityStream(
             proc=proc,
@@ -570,14 +602,38 @@ class AntigravityClient:
             tools=tools,
             is_worker=False,
             thinking_reader=thinking_reader,
+            request_token=request_token,
         )
         if stream:
             return stream_iter
         return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
 
-    def _create_chat_completion(
+    def _create_chat_completion(self, **kwargs: Any) -> Any:
+        token = threading.Event()
+        with self._lock:
+            self._requests[token] = SimpleNamespace(proc=None, stream=None)
+        try:
+            result = self._create_request(request_token=token, **kwargs)
+            self._check_cancelled(token)
+            return result
+        except BaseException:
+            with self._lock:
+                request = self._requests.pop(token, None)
+            if request is not None:
+                stream = request.stream() if request.stream is not None else None
+                if stream is not None:
+                    stream.close()
+                if request.proc is not None:
+                    with self._lock:
+                        self._active_processes.discard(request.proc)
+                    self._terminate_process(request.proc)
+            self._check_cancelled(token)
+            raise
+
+    def _create_request(
         self,
         *,
+        request_token,
         model: str | None = None,
         messages: list[dict[str, Any]] | None = None,
         timeout: float | None = None,
@@ -587,6 +643,7 @@ class AntigravityClient:
         reasoning_effort: str | None = None,
         **extra_kwargs: Any,
     ) -> Any:
+        self._check_cancelled(request_token)
         if self.is_closed:
             raise RuntimeError("AntigravityClient is closed.")
 
@@ -596,6 +653,7 @@ class AntigravityClient:
                 "to log in with your Google account."
             )
 
+        self._check_cancelled(request_token)
         effort_param = reasoning_effort or extra_kwargs.get("reasoning_effort")
         resolved_model, effort = self._resolve_model_and_effort(model, effort_param)
         messages_list = list(messages or [])
@@ -608,6 +666,11 @@ class AntigravityClient:
             reasoning_emitter = collector_emitter(
                 extra_kwargs.get("_agy_session_id"), extra_kwargs.get("_agy_request_token"), client=self
             )
+        # Hermes' streaming caller passes an httpx.Timeout, not a scalar; use
+        # its read budget instead of silently falling back to the default.
+        if hasattr(timeout, "read"):
+            read_timeout = getattr(timeout, "read")
+            timeout = float("inf") if read_timeout is None else read_timeout
         effective_timeout = (
             float(timeout)
             if isinstance(timeout, (int, float)) and timeout > 0
@@ -616,10 +679,14 @@ class AntigravityClient:
 
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:
+            thinking_reader = None
             try:
+                self._check_cancelled(request_token)
                 rules = self._sync_workspace_rules(messages_list)
-                proc = self._get_or_spawn_worker(resolved_model, effort)
                 with self._lock:
+                    self._check_cancelled(request_token)
+                    proc = self._get_or_spawn_worker(resolved_model, effort)
+                    self._bind_request_process(request_token, proc)
                     is_continuation = _messages_match_prefix(self._worker_history, messages_list)
 
                 if is_continuation:
@@ -628,7 +695,10 @@ class AntigravityClient:
                 else:
                     if self._worker_history:
                         self._terminate_worker()
-                        proc = self._get_or_spawn_worker(resolved_model, effort)
+                        with self._lock:
+                            self._check_cancelled(request_token)
+                            proc = self._get_or_spawn_worker(resolved_model, effort)
+                            self._bind_request_process(request_token, proc)
                     prompt_payload = _format_messages_as_prompt(
                         messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice,
                         rules_in_workspace=rules,
@@ -640,8 +710,12 @@ class AntigravityClient:
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
                 except (BrokenPipeError, OSError):
+                    self._check_cancelled(request_token)
                     self._terminate_worker()
-                    proc = self._get_or_spawn_worker(resolved_model, effort)
+                    with self._lock:
+                        self._check_cancelled(request_token)
+                        proc = self._get_or_spawn_worker(resolved_model, effort)
+                        self._bind_request_process(request_token, proc)
                     prompt_payload = _format_messages_as_prompt(
                         messages_list, model=resolved_model, tools=tools, tool_choice=tool_choice,
                         rules_in_workspace=rules,
@@ -666,17 +740,20 @@ class AntigravityClient:
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
                     thinking_reader=thinking_reader,
+                    request_token=request_token,
                 )
+                worker_acquired = False  # stream now owns lock release
                 if stream:
                     return stream_iter
-                try:
-                    return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
-                finally:
-                    if self._worker_lock.locked():
-                        self._worker_lock.release()
-            except Exception:
-                self._terminate_worker()
-                if self._worker_lock.locked():
+                return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
+            except BaseException:
+                if worker_acquired:
+                    with self._lock:
+                        request = self._requests.get(request_token)
+                        if request is not None and request.proc is self._worker_proc:
+                            self._terminate_worker_locked()
+                    if thinking_reader is not None:
+                        thinking_reader.close()
                     self._worker_lock.release()
                 raise
         else:
@@ -689,4 +766,5 @@ class AntigravityClient:
                 tool_choice=tool_choice,
                 stream=stream,
                 reasoning_emitter=reasoning_emitter,
+                request_token=request_token,
             )

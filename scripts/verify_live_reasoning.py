@@ -67,7 +67,9 @@ def main():
                 'Do not use any tools. Solve carefully: a bag has 4 red, 5 blue, and 6 green balls. Draw 6 without replacement. Given that each color appears, what is the exact probability that exactly two colors have equal counts? Enumerate the relevant count patterns and check the conditional denominator. Give a compact derivation and reduced fraction.'}], tools_for_api=[])
             request['timeout'] = 90
             assert request['_agy_session_id'] == session_id
-            assert not _should_stream(agent), 'Production external-process gate changed'
+            assert _should_stream(agent), 'Provider must opt into native streaming'
+            agent._disable_streaming = True  # this probe specifically tests the legacy collector
+            assert not _should_stream(agent)
             callbacks = get_plugin_manager()._middleware.get('llm_execution', [])
             assert any(c.__module__.endswith('.live_reasoning') for c in callbacks)
             started = time.monotonic()
@@ -83,7 +85,7 @@ def main():
                 message = verdict.response.choices[0].message
                 reasoning_events = [(t,f) for t,f in frames
                                     if f.get('params',{}).get('type') == 'reasoning.delta']
-                receipt = {'production_should_stream':False,'auth_type':profile.auth_type,
+                receipt = {'default_should_stream':True,'probe_should_stream':False,'auth_type':profile.auth_type,
                     'model':agent.model,'middleware_registered':True,
                     'completion_seconds':completed,'reasoning_chars':len(message.reasoning_content or ''),
                     'answer_chars':len(message.content or ''),'finish_reason':verdict.response.choices[0].finish_reason,
