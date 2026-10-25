@@ -1937,6 +1937,7 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("USERPROFILE", env)
         self.assertEqual(env["HOME"], str(client._isolated_home))
         self.assertEqual(env["USERPROFILE"], str(client._isolated_home))
+        self.assertEqual(env["AGY_CLI_DISABLE_AUTO_UPDATE"], "true")
         client.close()
 
     def test_token_linking_fallback_chain(self):

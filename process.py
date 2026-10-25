@@ -608,6 +608,8 @@ def build_child_env(isolated_home: Path | str) -> dict[str, str]:
     env["USERPROFILE"] = home_str
     if "HOMEPATH" in env:
         env["HOMEPATH"] = home_str
+    # agy's background updater would otherwise open its own console on Windows (issue #2).
+    env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
     return env
 
 
